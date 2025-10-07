@@ -72,3 +72,13 @@ A simple single loop (printing names sequentially) is insufficient because it pr
 ### Q2. What is the purpose of ioctl in this context, and limitations of fixed-width fallback?
 `ioctl()` with `TIOCGWINSZ` is used to query the terminal window size (columns and rows). Knowing the terminal width allows the program to dynamically calculate how many columns will fit and adapt the layout to the user's current terminal size. If only a fixed-width fallback (e.g., 80) is used, the program will not adapt when the user resizes the terminal; output may either wrap unexpectedly on small windows or waste space on large ones, reducing usability and not matching the behavior of the standard `ls`.
 
+### Feature 4 — Horizontal Column Display (-x)
+
+**Q1.** Compare the complexity of “down then across” vs. “across” printing logic.  
+**A1.** The “down then across” format requires pre-calculating both rows and columns and indexing into the filename array using computed offsets, which is more complex.  
+The “across” (horizontal) method only tracks current screen width and wraps when needed, requiring minimal pre-calculation.
+
+**Q2.** How did you manage the different display modes (-l, -x, and default)?  
+**A2.** I introduced a `mode` variable. The getopt parser sets `mode = 1` for `-l`, `mode = 2` for `-x`, and `mode = 0` for default.  
+After collecting filenames, `main()` checks this variable and calls the appropriate display function, keeping logic clear and modular.
+
