@@ -105,3 +105,16 @@ This feature adds ANSI-based color highlighting to filenames depending on file t
 ANSI escape sequences are strings starting with ESC (`\033` or `\x1B`) followed by `[` and parameters ending with `m` to set text attributes. Example for bright green:
 ```c
 printf("\033[1;32mHello\033[0m\n");
+
+## Feature-7: ls-v1.6.0 — Recursive Listing (-R)
+
+### Summary
+This feature adds recursive directory traversal triggered by `-R`. The program prints the contents of the initial directory and then recursively descends into each subdirectory, printing a directory header (e.g., `/path/to/dir:`) before listing that directory.
+
+---
+
+### Q1. What is a "base case"? In the context of your recursive ls, what stops recursion?
+A base case is the condition in a recursive function that prevents further recursive calls and allows the recursion to terminate. For `ls -R`, recursion naturally stops when a directory has no child directories (after filtering `.` and `..`). The function lists entries and only makes recursive calls for entries that are directories (checked via `S_ISDIR` on `lstat` results). If no child entries are directories, recursion does not continue down that branch. Additionally, unreadable directories (opendir/lstat failures) serve as practical stopping points.
+
+### Q2. Why build a full path before recursing?
+Constructing the full path (e.g., `parent/child`) is essential so the recursive call operates on the correct directory regardless of the current working directory. If you called `list_dir("subdir")` from inside `list_dir("parent")` without a full path, the call would resolve `subdir` relative to the process's current working directory — which might not be `parent` and would lead to wrong results or failures. Using a full path guarantees correct, unambiguous traversal.
