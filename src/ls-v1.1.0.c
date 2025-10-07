@@ -1,9 +1,18 @@
 /* src/ls.c
- * ls v1.2.0
- * - supports: default multi-column display ("down then across")
- * - supports: -l long listing (uses lstat, getpwuid, getgrgid, ctime)
  *
- * Build: make
+ * ls - simplified implementation with -l (long listing)
+ * v1.1.0
+ *
+ * Features:
+ *  - parse -l with getopt()
+ *  - use lstat() so symlinks are reported as links (not followed)
+ *  - resolve owner/group with getpwuid/getgrgid
+ *  - permission string including special bits (setuid, setgid, sticky)
+ *  - time formatting similar to ls (shows time if mtime within 6 months, else year)
+ *  - aligns columns by computing widths before printing
+ *  - prints symlink target like: name -> target
+ *
+ * Build with your Makefile (make).
  */
 
 #define _XOPEN_SOURCE 700
@@ -12,7 +21,6 @@
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
 #include <pwd.h>
 #include <grp.h>
@@ -20,16 +28,18 @@
 #include <errno.h>
 #include <limits.h>
 #include <getopt.h>
+#include <stdint.h>
 
 typedef struct {
     char *name;
     char *fullpath;
     struct stat st;
     int is_link;
-    char *link_target;
+    char *link_target; // if symlink
 } entry_t;
 
-/* Build permission string into buf (buf must be at least 11 bytes) */
+static char perms_buf[11];
+
 static void build_perm_string(mode_t m, char *buf) {
     buf[0] = S_ISDIR(m) ? 'd' :
              S_ISLNK(m) ? 'l' :
@@ -40,32 +50,41 @@ static void build_perm_string(mode_t m, char *buf) {
 
     buf[1] = (m & S_IRUSR) ? 'r' : '-';
     buf[2] = (m & S_IWUSR) ? 'w' : '-';
-    if (m & S_ISUID) buf[3] = (m & S_IXUSR) ? 's' : 'S';
-    else buf[3] = (m & S_IXUSR) ? 'x' : '-';
+    // user exec with setuid
+    if (m & S_ISUID) {
+        buf[3] = (m & S_IXUSR) ? 's' : 'S';
+    } else {
+        buf[3] = (m & S_IXUSR) ? 'x' : '-';
+    }
 
     buf[4] = (m & S_IRGRP) ? 'r' : '-';
     buf[5] = (m & S_IWGRP) ? 'w' : '-';
-    if (m & S_ISGID) buf[6] = (m & S_IXGRP) ? 's' : 'S';
-    else buf[6] = (m & S_IXGRP) ? 'x' : '-';
+    // group exec with setgid
+    if (m & S_ISGID) {
+        buf[6] = (m & S_IXGRP) ? 's' : 'S';
+    } else {
+        buf[6] = (m & S_IXGRP) ? 'x' : '-';
+    }
 
     buf[7] = (m & S_IROTH) ? 'r' : '-';
     buf[8] = (m & S_IWOTH) ? 'w' : '-';
-    if (m & S_ISVTX) buf[9] = (m & S_IXOTH) ? 't' : 'T';
-    else buf[9] = (m & S_IXOTH) ? 'x' : '-';
+    // other exec with sticky bit
+    if (m & S_ISVTX) {
+        buf[9] = (m & S_IXOTH) ? 't' : 'T';
+    } else {
+        buf[9] = (m & S_IXOTH) ? 'x' : '-';
+    }
 
     buf[10] = '\0';
 }
 
-/* Comparator for qsort: alphabetical */
 static int cmp_entries(const void *a, const void *b) {
     const entry_t *ea = a;
     const entry_t *eb = b;
     return strcmp(ea->name, eb->name);
 }
 
-/* Free entries array */
 static void free_entries(entry_t *ents, size_t n) {
-    if (!ents) return;
     for (size_t i = 0; i < n; ++i) {
         free(ents[i].name);
         free(ents[i].fullpath);
@@ -74,7 +93,6 @@ static void free_entries(entry_t *ents, size_t n) {
     free(ents);
 }
 
-/* Collect directory entries into dynamic array of entry_t (skips hidden files) */
 static void collect_directory(const char *path, entry_t **out_entries, size_t *out_n) {
     DIR *d = opendir(path);
     if (!d) {
@@ -97,7 +115,7 @@ static void collect_directory(const char *path, entry_t **out_entries, size_t *o
     }
 
     while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue; /* skip hidden files for now */
+        if (de->d_name[0] == '.') continue; // skip hidden by default (Feature-2 doesn't require -a)
         if (count >= capacity) {
             capacity *= 2;
             entry_t *tmp = realloc(arr, capacity * sizeof(entry_t));
@@ -129,11 +147,17 @@ static void collect_directory(const char *path, entry_t **out_entries, size_t *o
         arr[count].is_link = 0;
         arr[count].link_target = NULL;
         if (lstat(arr[count].fullpath, &arr[count].st) == -1) {
-            /* on error, zero the struct */
-            memset(&arr[count].st, 0, sizeof(struct stat));
+            // on error, fill zeros (but keep name)
+            arr[count].st.st_mode = 0;
+            arr[count].st.st_nlink = 0;
+            arr[count].st.st_uid = 0;
+            arr[count].st.st_gid = 0;
+            arr[count].st.st_size = 0;
+            arr[count].st.st_mtime = 0;
         } else {
             if (S_ISLNK(arr[count].st.st_mode)) {
                 arr[count].is_link = 1;
+                // read link target
                 char buf[PATH_MAX+1];
                 ssize_t r = readlink(arr[count].fullpath, buf, PATH_MAX);
                 if (r >= 0) {
@@ -142,69 +166,100 @@ static void collect_directory(const char *path, entry_t **out_entries, size_t *o
                 }
             }
         }
+
         count++;
     }
 
     closedir(d);
 
-    /* sort alphabetically */
+    // sort entries alphabetically
     qsort(arr, count, sizeof(entry_t), cmp_entries);
 
     *out_entries = arr;
     *out_n = count;
 }
 
-/* Print long listing (ls -l) */
 static void print_long_listing(entry_t *ents, size_t n) {
-    if (n == 0) return;
-    size_t link_w = 0, owner_w = 0, group_w = 0, size_w = 0;
-
-    for (size_t i = 0; i < n; ++i) {
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "%ld", (long)ents[i].st.st_nlink);
-        if (strlen(tmp) > link_w) link_w = strlen(tmp);
-
-        struct passwd *pw = getpwuid(ents[i].st.st_uid);
-        const char *on = pw ? pw->pw_name : "unknown";
-        if (strlen(on) > owner_w) owner_w = strlen(on);
-
-        struct group *gr = getgrgid(ents[i].st.st_gid);
-        const char *gn = gr ? gr->gr_name : "unknown";
-        if (strlen(gn) > group_w) group_w = strlen(gn);
-
-        snprintf(tmp, sizeof(tmp), "%lld", (long long)ents[i].st.st_size);
-        if (strlen(tmp) > size_w) size_w = strlen(tmp);
-    }
-
-    time_t now = time(NULL);
-    const time_t six_months = (time_t)(60LL*60*24*30*6); /* approx */
+    // compute widths
+    size_t link_w = 0;
+    size_t owner_w = 0;
+    size_t group_w = 0;
+    size_t size_w = 0;
 
     for (size_t i = 0; i < n; ++i) {
         char perm[11];
         build_perm_string(ents[i].st.st_mode, perm);
-        printf("%s ", perm);
+
+        // links width
+        size_t lwidth = 0;
+        {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%ld", (long)ents[i].st.st_nlink);
+            lwidth = strlen(tmp);
+        }
+        if (lwidth > link_w) link_w = lwidth;
+
+        // owner width
+        {
+            struct passwd *pw = getpwuid(ents[i].st.st_uid);
+            const char *on = pw ? pw->pw_name : "unknown";
+            size_t w = strlen(on);
+            if (w > owner_w) owner_w = w;
+        }
+        // group width
+        {
+            struct group *gr = getgrgid(ents[i].st.st_gid);
+            const char *gn = gr ? gr->gr_name : "unknown";
+            size_t w = strlen(gn);
+            if (w > group_w) group_w = w;
+        }
+        // size width
+        {
+            char tmp[64];
+            snprintf(tmp, sizeof(tmp), "%lld", (long long)ents[i].st.st_size);
+            size_t w = strlen(tmp);
+            if (w > size_w) size_w = w;
+        }
+    }
+
+    // print lines
+    time_t now = time(NULL);
+    const time_t six_months = (time_t) (60LL*60*24*30*6); // approximate 6 months
+
+    for (size_t i = 0; i < n; ++i) {
+        build_perm_string(ents[i].st.st_mode, perms_buf);
+
+        // links
+        printf("%s ", perms_buf);
         printf("%*ld ", (int)link_w, (long)ents[i].st.st_nlink);
 
+        // owner and group
         struct passwd *pw = getpwuid(ents[i].st.st_uid);
         struct group *gr = getgrgid(ents[i].st.st_gid);
         const char *on = pw ? pw->pw_name : "unknown";
         const char *gn = gr ? gr->gr_name : "unknown";
         printf("%-*s %-*s ", (int)owner_w, on, (int)group_w, gn);
 
+        // size
         printf("%*lld ", (int)size_w, (long long)ents[i].st.st_size);
 
+        // time formatting similar to ls
         char timebuf[64];
         struct tm *tm_info = localtime(&ents[i].st.st_mtime);
-        if (!tm_info) strcpy(timebuf, "??? ?? ??:??");
-        else {
-            if ((now - ents[i].st.st_mtime) > six_months || (ents[i].st.st_mtime - now) > six_months) {
+        if (!tm_info) {
+            strcpy(timebuf, "??? ?? ??:??");
+        } else {
+            if ( (now - ents[i].st.st_mtime) > six_months || (ents[i].st.st_mtime - now) > six_months ) {
+                // older than 6 months: show "Mon DD  YYYY"
                 strftime(timebuf, sizeof(timebuf), "%b %e  %Y", tm_info);
             } else {
+                // recent: show "Mon DD HH:MM"
                 strftime(timebuf, sizeof(timebuf), "%b %e %H:%M", tm_info);
             }
         }
         printf("%s ", timebuf);
 
+        // name
         if (ents[i].is_link && ents[i].link_target) {
             printf("%s -> %s\n", ents[i].name, ents[i].link_target);
         } else {
@@ -213,57 +268,10 @@ static void print_long_listing(entry_t *ents, size_t n) {
     }
 }
 
-/* Print multi-column "down then across" (default display) */
-static void print_columns(entry_t *ents, size_t n) {
-    if (n == 0) return;
-
-    /* gather names and compute max length */
-    size_t max_len = 0;
-    char **names = malloc(n * sizeof(char*));
-    if (!names) {
-        perror("malloc");
-        return;
-    }
+static void print_simple(entry_t *ents, size_t n) {
     for (size_t i = 0; i < n; ++i) {
-        names[i] = ents[i].name;
-        size_t l = strlen(names[i]);
-        if (l > max_len) max_len = l;
+        printf("%s\n", ents[i].name);
     }
-
-    /* get terminal width via ioctl */
-    struct winsize ws;
-    int term_width = 80; /* fallback */
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
-        term_width = ws.ws_col;
-    }
-
-    int spacing = 2;
-    size_t col_width = max_len + spacing;
-    int cols = 1;
-    if ((int)col_width <= term_width) {
-        cols = term_width / (int)col_width;
-        if (cols < 1) cols = 1;
-    } else {
-        cols = 1;
-    }
-
-    int rows = (int)((n + cols - 1) / cols); /* ceil */
-
-    /* Print row by row, pulling entries from each column */
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            int idx = c * rows + r;
-            if (idx < (int)n) {
-                /* For the last column, do not pad beyond name if you prefer;
-                   but padding is harmless and matches typical ls spacing. */
-                printf("%-*s", (int)col_width, names[idx]);
-            }
-        }
-        printf("\n");
-    }
-
-    /* Note: do not free names[i] here — they belong to ents[].name */
-    free(names);
 }
 
 int main(int argc, char *argv[]) {
@@ -274,22 +282,28 @@ int main(int argc, char *argv[]) {
             case 'l':
                 long_listing = 1;
                 break;
-            default:
+            default: /* '?' */
                 fprintf(stderr, "Usage: %s [-l] [directory]\n", argv[0]);
                 exit(EXIT_FAILURE);
         }
     }
 
     const char *path = ".";
-    if (optind < argc) path = argv[optind];
+    if (optind < argc) {
+        path = argv[optind];
+    }
 
     entry_t *ents = NULL;
     size_t n = 0;
     collect_directory(path, &ents, &n);
 
-    if (long_listing) print_long_listing(ents, n);
-    else print_columns(ents, n);
+    if (long_listing) {
+        print_long_listing(ents, n);
+    } else {
+        print_simple(ents, n);
+    }
 
     free_entries(ents, n);
     return 0;
 }
+
