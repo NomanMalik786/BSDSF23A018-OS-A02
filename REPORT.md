@@ -95,3 +95,13 @@ Sorting requires random access to all elements so that they can be compared and 
 Its prototype is:
 ```c
 int compar(const void *a, const void *b);
+
+## Feature-6: ls-v1.5.0 — Colorized Output Based on File Type
+
+### Summary
+This feature adds ANSI-based color highlighting to filenames depending on file type (directory, executable, archives, symbolic links, special files). The program uses `lstat()`/`stat()` to get `st_mode` and then applies ANSI sequences to print colored names.
+
+### Q1. How do ANSI escape codes work to produce color in a standard Linux terminal? Show the specific code sequence for printing text in green.
+ANSI escape sequences are strings starting with ESC (`\033` or `\x1B`) followed by `[` and parameters ending with `m` to set text attributes. Example for bright green:
+```c
+printf("\033[1;32mHello\033[0m\n");
