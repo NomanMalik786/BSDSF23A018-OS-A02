@@ -1,0 +1,7 @@
+# Ignore binaries
+*.tar.gz
+*.o
+bin/
+
+# Ignore backup source files
+src/ls-backup-*.c
