@@ -1,313 +1,301 @@
-/*
- * src/ls.c
- * ls v1.3.0
- * - supports: default multi-column display ("down then across")
- * - supports: -l long listing (uses lstat, getpwuid, getgrgid, ctime)
- * - supports: -x horizontal column display (row-major)
- *
- * Build: make
- */
-
-#define _XOPEN_SOURCE 700
+#define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
+#include <sys/types.h>
 #include <sys/stat.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
 #include <pwd.h>
 #include <grp.h>
 #include <time.h>
+#include <sys/ioctl.h>
 #include <errno.h>
 #include <limits.h>
+#include <linux/limits.h>   // for PATH_MAX
 #include <getopt.h>
+#include <ctype.h>
+/* ---------- ANSI COLOR CODES ---------- */
+#define COLOR_RESET   "\033[0m"
+#define COLOR_BLUE    "\033[1;34m"
+#define COLOR_GREEN   "\033[1;32m"
+#define COLOR_RED     "\033[1;31m"
+#define COLOR_MAGENTA "\033[1;35m"
+#define COLOR_REVERSE "\033[7m"
 
-/* Structure to store file information */
+/* ---------- STRUCT DEFINITION ---------- */
 typedef struct {
     char *name;
-    char *fullpath;
     struct stat st;
     int is_link;
-    char *link_target;
+    char link_target[PATH_MAX];
 } entry_t;
 
-/* Build permission string into buf (buf must be at least 11 bytes) */
-static void build_perm_string(mode_t m, char *buf) {
-    buf[0] = S_ISDIR(m) ? 'd' :
-             S_ISLNK(m) ? 'l' :
-             S_ISCHR(m) ? 'c' :
-             S_ISBLK(m) ? 'b' :
-             S_ISFIFO(m) ? 'p' :
-             S_ISSOCK(m) ? 's' : '-';
+/* ---------- PROTOTYPES ---------- */
+static void list_dir(const char *path, int mode);
+static void print_long_listing(entry_t *ents, size_t count);
+static void print_columns(entry_t *ents, size_t count);
+static void print_horizontal(entry_t *ents, size_t count);
+static int cmp_entries(const void *a, const void *b);
+static void build_perm_string(mode_t m, char *out);
+static void print_with_color(const char *name, const struct stat *st);
 
-    buf[1] = (m & S_IRUSR) ? 'r' : '-';
-    buf[2] = (m & S_IWUSR) ? 'w' : '-';
-    if (m & S_ISUID) buf[3] = (m & S_IXUSR) ? 's' : 'S';
-    else buf[3] = (m & S_IXUSR) ? 'x' : '-';
+/* ---------- Helper: read directory ---------- */
+static entry_t *read_dir_entries(const char *path, size_t *out_count) {
+    DIR *dirp = opendir(path);
+    if (!dirp) {
+        perror("opendir");
+        return NULL;
+    }
 
-    buf[4] = (m & S_IRGRP) ? 'r' : '-';
-    buf[5] = (m & S_IWGRP) ? 'w' : '-';
-    if (m & S_ISGID) buf[6] = (m & S_IXGRP) ? 's' : 'S';
-    else buf[6] = (m & S_IXGRP) ? 'x' : '-';
+    size_t cap = 64, count = 0;
+    entry_t *arr = malloc(cap * sizeof(entry_t));
+    if (!arr) {
+        perror("malloc");
+        closedir(dirp);
+        return NULL;
+    }
 
-    buf[7] = (m & S_IROTH) ? 'r' : '-';
-    buf[8] = (m & S_IWOTH) ? 'w' : '-';
-    if (m & S_ISVTX) buf[9] = (m & S_IXOTH) ? 't' : 'T';
-    else buf[9] = (m & S_IXOTH) ? 'x' : '-';
+    struct dirent *dp;
+    while ((dp = readdir(dirp)) != NULL) {
+        if (dp->d_name[0] == '.')
+            continue; // skip hidden files
 
-    buf[10] = '\0';
+        if (count == cap) {
+            cap *= 2;
+            entry_t *tmp = realloc(arr, cap * sizeof(entry_t));
+            if (!tmp) {
+                perror("realloc");
+                free(arr);
+                closedir(dirp);
+                return NULL;
+            }
+            arr = tmp;
+        }
+
+        arr[count].name = strdup(dp->d_name);
+        arr[count].is_link = 0;
+        arr[count].link_target[0] = '\0';
+
+        char fullpath[PATH_MAX];
+        snprintf(fullpath, sizeof(fullpath), "%s/%s", path, dp->d_name);
+
+        if (lstat(fullpath, &arr[count].st) == -1) {
+            perror("lstat");
+            continue;
+        }
+
+        if (S_ISLNK(arr[count].st.st_mode)) {
+            arr[count].is_link = 1;
+            ssize_t len = readlink(fullpath, arr[count].link_target,
+                                   sizeof(arr[count].link_target) - 1);
+            if (len != -1)
+                arr[count].link_target[len] = '\0';
+        }
+        count++;
+    }
+
+    closedir(dirp);
+    *out_count = count;
+    return arr;
 }
 
-/* Comparator for qsort: alphabetical */
+/* ---------- Comparator for qsort ---------- */
 static int cmp_entries(const void *a, const void *b) {
     const entry_t *ea = a;
     const entry_t *eb = b;
     return strcmp(ea->name, eb->name);
 }
 
-/* Free entries array */
-static void free_entries(entry_t *ents, size_t n) {
-    if (!ents) return;
-    for (size_t i = 0; i < n; ++i) {
-        free(ents[i].name);
-        free(ents[i].fullpath);
-        if (ents[i].link_target) free(ents[i].link_target);
-    }
-    free(ents);
+/* ---------- Helper: build permissions ---------- */
+static void build_perm_string(mode_t m, char *out) {
+    strcpy(out, "----------");
+    if (S_ISDIR(m)) out[0] = 'd';
+    else if (S_ISLNK(m)) out[0] = 'l';
+    else if (S_ISCHR(m)) out[0] = 'c';
+    else if (S_ISBLK(m)) out[0] = 'b';
+    else if (S_ISFIFO(m)) out[0] = 'p';
+    else if (S_ISSOCK(m)) out[0] = 's';
+
+    if (m & S_IRUSR) out[1] = 'r';
+    if (m & S_IWUSR) out[2] = 'w';
+    if (m & S_IXUSR) out[3] = 'x';
+    if (m & S_IRGRP) out[4] = 'r';
+    if (m & S_IWGRP) out[5] = 'w';
+    if (m & S_IXGRP) out[6] = 'x';
+    if (m & S_IROTH) out[7] = 'r';
+    if (m & S_IWOTH) out[8] = 'w';
+    if (m & S_IXOTH) out[9] = 'x';
 }
 
-/* Collect directory entries into dynamic array of entry_t (skips hidden files) */
-static void collect_directory(const char *path, entry_t **out_entries, size_t *out_n) {
-    DIR *d = opendir(path);
-    if (!d) {
-        perror(path);
-        *out_entries = NULL;
-        *out_n = 0;
-        return;
-    }
-
-    struct dirent *de;
-    size_t capacity = 64;
-    size_t count = 0;
-    entry_t *arr = calloc(capacity, sizeof(entry_t));
-    if (!arr) {
-        perror("calloc");
-        closedir(d);
-        *out_entries = NULL;
-        *out_n = 0;
-        return;
-    }
-
-    while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue; /* skip hidden files */
-        if (count >= capacity) {
-            capacity *= 2;
-            entry_t *tmp = realloc(arr, capacity * sizeof(entry_t));
-            if (!tmp) {
-                perror("realloc");
-                free_entries(arr, count);
-                closedir(d);
-                *out_entries = NULL;
-                *out_n = 0;
-                return;
-            }
-            arr = tmp;
-        }
-
-        arr[count].name = strdup(de->d_name);
-        size_t pathlen = strlen(path);
-        size_t namelen = strlen(de->d_name);
-        arr[count].fullpath = malloc(pathlen + 1 + namelen + 1);
-        if (!arr[count].fullpath) {
-            perror("malloc");
-            free_entries(arr, count);
-            closedir(d);
-            *out_entries = NULL;
-            *out_n = 0;
-            return;
-        }
-        snprintf(arr[count].fullpath, pathlen + 1 + namelen + 1, "%s/%s", path, de->d_name);
-
-        arr[count].is_link = 0;
-        arr[count].link_target = NULL;
-        if (lstat(arr[count].fullpath, &arr[count].st) == -1) {
-            memset(&arr[count].st, 0, sizeof(struct stat));
-        } else {
-            if (S_ISLNK(arr[count].st.st_mode)) {
-                arr[count].is_link = 1;
-                char buf[PATH_MAX+1];
-                ssize_t r = readlink(arr[count].fullpath, buf, PATH_MAX);
-                if (r >= 0) {
-                    buf[r] = '\0';
-                    arr[count].link_target = strdup(buf);
-                }
-            }
-        }
-        count++;
-    }
-
-    closedir(d);
-    qsort(arr, count, sizeof(entry_t), cmp_entries);
-    *out_entries = arr;
-    *out_n = count;
+/* ---------- Color helpers ---------- */
+static int has_archive_ext(const char *name) {
+    if (!name) return 0;
+    const char *dot = strrchr(name, '.');
+    if (!dot) return 0;
+    return (strcmp(dot, ".tar") == 0 ||
+            strcmp(dot, ".gz")  == 0 ||
+            strcmp(dot, ".zip") == 0);
 }
 
-/* Print long listing (ls -l) */
-static void print_long_listing(entry_t *ents, size_t n) {
-    if (n == 0) return;
-    size_t link_w = 0, owner_w = 0, group_w = 0, size_w = 0;
+static void print_with_color(const char *name, const struct stat *st) {
+    const char *color = COLOR_RESET;
 
-    for (size_t i = 0; i < n; ++i) {
-        char tmp[64];
-        snprintf(tmp, sizeof(tmp), "%ld", (long)ents[i].st.st_nlink);
-        if (strlen(tmp) > link_w) link_w = strlen(tmp);
-
-        struct passwd *pw = getpwuid(ents[i].st.st_uid);
-        const char *on = pw ? pw->pw_name : "unknown";
-        if (strlen(on) > owner_w) owner_w = strlen(on);
-
-        struct group *gr = getgrgid(ents[i].st.st_gid);
-        const char *gn = gr ? gr->gr_name : "unknown";
-        if (strlen(gn) > group_w) group_w = strlen(gn);
-
-        snprintf(tmp, sizeof(tmp), "%lld", (long long)ents[i].st.st_size);
-        if (strlen(tmp) > size_w) size_w = strlen(tmp);
+    if (S_ISDIR(st->st_mode)) {
+        color = COLOR_BLUE;
+    } else if (S_ISLNK(st->st_mode)) {
+        color = COLOR_MAGENTA;
+    } else if (S_ISCHR(st->st_mode) || S_ISBLK(st->st_mode) ||
+               S_ISFIFO(st->st_mode) || S_ISSOCK(st->st_mode)) {
+        color = COLOR_REVERSE;
+    } else if (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) {
+        color = COLOR_GREEN;
+    } else if (has_archive_ext(name)) {
+        color = COLOR_RED;
+    } else {
+        color = COLOR_RESET;
     }
 
-    time_t now = time(NULL);
-    const time_t six_months = (time_t)(60LL*60*24*30*6); /* approx */
+    printf("%s%s%s", color, name, COLOR_RESET);
+}
 
-    for (size_t i = 0; i < n; ++i) {
+/* ---------- Long listing ---------- */
+static void print_long_listing(entry_t *ents, size_t count) {
+    for (size_t i = 0; i < count; i++) {
         char perm[11];
         build_perm_string(ents[i].st.st_mode, perm);
-        printf("%s ", perm);
-        printf("%*ld ", (int)link_w, (long)ents[i].st.st_nlink);
 
         struct passwd *pw = getpwuid(ents[i].st.st_uid);
-        struct group *gr = getgrgid(ents[i].st.st_gid);
-        const char *on = pw ? pw->pw_name : "unknown";
-        const char *gn = gr ? gr->gr_name : "unknown";
-        printf("%-*s %-*s ", (int)owner_w, on, (int)group_w, gn);
-
-        printf("%*lld ", (int)size_w, (long long)ents[i].st.st_size);
+        struct group  *gr = getgrgid(ents[i].st.st_gid);
 
         char timebuf[64];
-        struct tm *tm_info = localtime(&ents[i].st.st_mtime);
-        if (!tm_info) strcpy(timebuf, "??? ?? ??:??");
-        else {
-            if ((now - ents[i].st.st_mtime) > six_months || (ents[i].st.st_mtime - now) > six_months)
-                strftime(timebuf, sizeof(timebuf), "%b %e  %Y", tm_info);
-            else
-                strftime(timebuf, sizeof(timebuf), "%b %e %H:%M", tm_info);
-        }
-        printf("%s ", timebuf);
+        strftime(timebuf, sizeof(timebuf), "%b %d %H:%M",
+                 localtime(&ents[i].st.st_mtime));
 
-        if (ents[i].is_link && ents[i].link_target)
-            printf("%s -> %s\n", ents[i].name, ents[i].link_target);
-        else
-            printf("%s\n", ents[i].name);
+        printf("%s %3ld %-8s %-8s %8ld %s ",
+               perm,
+               (long)ents[i].st.st_nlink,
+               pw ? pw->pw_name : "unknown",
+               gr ? gr->gr_name : "unknown",
+               (long)ents[i].st.st_size,
+               timebuf);
+
+        if (ents[i].is_link && ents[i].link_target[0]) {
+            print_with_color(ents[i].name, &ents[i].st);
+            printf(" -> %s\n", ents[i].link_target);
+        } else {
+            print_with_color(ents[i].name, &ents[i].st);
+            printf("\n");
+        }
     }
 }
 
-/* Print multi-column "down then across" (default display) */
-static void print_columns(entry_t *ents, size_t n) {
-    if (n == 0) return;
+/* ---------- Down-then-across (default) ---------- */
+static void print_columns(entry_t *ents, size_t count) {
+    if (count == 0) return;
 
     size_t max_len = 0;
-    char **names = malloc(n * sizeof(char*));
-    if (!names) {
-        perror("malloc");
-        return;
-    }
-    for (size_t i = 0; i < n; ++i) {
-        names[i] = ents[i].name;
-        size_t l = strlen(names[i]);
-        if (l > max_len) max_len = l;
-    }
-
-    struct winsize ws;
-    int term_width = 80;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
-        term_width = ws.ws_col;
-
-    int spacing = 2;
-    size_t col_width = max_len + spacing;
-    int cols = (int)(term_width / col_width);
-    if (cols < 1) cols = 1;
-    int rows = (int)((n + cols - 1) / cols);
-
-    for (int r = 0; r < rows; ++r) {
-        for (int c = 0; c < cols; ++c) {
-            int idx = c * rows + r;
-            if (idx < (int)n)
-                printf("%-*s", (int)col_width, names[idx]);
-        }
-        printf("\n");
-    }
-
-    free(names);
-}
-
-/* Print horizontal "across" columns (ls -x) */
-static void print_horizontal(entry_t *ents, size_t n) {
-    if (n == 0) return;
-
-    size_t max_len = 0;
-    for (size_t i = 0; i < n; ++i) {
+    for (size_t i = 0; i < count; i++) {
         size_t len = strlen(ents[i].name);
         if (len > max_len) max_len = len;
     }
 
     struct winsize ws;
-    int term_width = 80;
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+    size_t term_width = 80;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0)
         term_width = ws.ws_col;
 
-    int spacing = 2;
-    int col_width = (int)max_len + spacing;
-    int current_width = 0;
+    size_t col_width = max_len + 2;
+    size_t cols = term_width / col_width;
+    if (cols < 1) cols = 1;
+    size_t rows = (count + cols - 1) / cols;
 
-    for (size_t i = 0; i < n; ++i) {
-        if (current_width + col_width > term_width) {
-            printf("\n");
-            current_width = 0;
+    for (size_t r = 0; r < rows; r++) {
+        for (size_t c = 0; c < cols; c++) {
+            size_t idx = c * rows + r;
+            if (idx >= count) continue;
+
+            const char *n = ents[idx].name;
+            print_with_color(n, &ents[idx].st);
+            int pad = (int)col_width - (int)strlen(n);
+            if (pad < 0) pad = 0;
+            for (int p = 0; p < pad; ++p) putchar(' ');
         }
-        printf("%-*s", col_width, ents[i].name);
-        current_width += col_width;
+        putchar('\n');
     }
-    printf("\n");
 }
 
+/* ---------- Horizontal (across) ---------- */
+static void print_horizontal(entry_t *ents, size_t count) {
+    if (count == 0) return;
+
+    size_t max_len = 0;
+    for (size_t i = 0; i < count; i++) {
+        size_t len = strlen(ents[i].name);
+        if (len > max_len) max_len = len;
+    }
+
+    struct winsize ws;
+    size_t term_width = 80;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0)
+        term_width = ws.ws_col;
+
+    size_t col_width = max_len + 2;
+    size_t current = 0;
+
+    for (size_t i = 0; i < count; i++) {
+        const char *n = ents[i].name;
+        size_t len = strlen(n);
+        if (current + len + 1 > term_width) {
+            putchar('\n');
+            current = 0;
+        }
+
+        print_with_color(n, &ents[i].st);
+        int pad = (int)col_width - (int)len;
+        if (pad < 1) pad = 1;
+        for (int p = 0; p < pad; ++p) putchar(' ');
+        current += len + pad;
+    }
+    putchar('\n');
+}
+
+/* ---------- Main directory handling ---------- */
+static void list_dir(const char *path, int mode) {
+    size_t count = 0;
+    entry_t *arr = read_dir_entries(path, &count);
+    if (!arr) return;
+
+    qsort(arr, count, sizeof(entry_t), cmp_entries);
+
+    if (mode == 1)
+        print_long_listing(arr, count);
+    else if (mode == 2)
+        print_horizontal(arr, count);
+    else
+        print_columns(arr, count);
+
+    for (size_t i = 0; i < count; i++)
+        free(arr[i].name);
+    free(arr);
+}
+
+/* ---------- MAIN ---------- */
 int main(int argc, char *argv[]) {
     int opt;
-    int mode = 0;   /* 0=default, 1=-l, 2=-x */
+    int mode = 0;  // 0=default, 1=-l, 2=-x
 
     while ((opt = getopt(argc, argv, "lx")) != -1) {
         switch (opt) {
-            case 'l': mode = 1; break;
-            case 'x': mode = 2; break;
-            default:
-                fprintf(stderr, "Usage: %s [-l | -x] [directory]\n", argv[0]);
-                exit(EXIT_FAILURE);
+        case 'l': mode = 1; break;
+        case 'x': mode = 2; break;
+        default:
+            fprintf(stderr, "Usage: %s [-l | -x] [path]\n", argv[0]);
+            exit(EXIT_FAILURE);
         }
     }
 
-    const char *path = ".";
-    if (optind < argc) path = argv[optind];
-
-    entry_t *ents = NULL;
-    size_t n = 0;
-    collect_directory(path, &ents, &n);
-
-    if (mode == 1)
-        print_long_listing(ents, n);
-    else if (mode == 2)
-        print_horizontal(ents, n);
-    else
-        print_columns(ents, n);
-
-    free_entries(ents, n);
+    const char *path = (optind < argc) ? argv[optind] : ".";
+    list_dir(path, mode);
     return 0;
 }
-
