@@ -82,3 +82,16 @@ The “across” (horizontal) method only tracks current screen width and wraps 
 **A2.** I introduced a `mode` variable. The getopt parser sets `mode = 1` for `-l`, `mode = 2` for `-x`, and `mode = 0` for default.  
 After collecting filenames, `main()` checks this variable and calls the appropriate display function, keeping logic clear and modular.
 
+## Feature-5: ls-v1.4.0 — Alphabetical Sort
+
+### Summary
+This feature ensures that all directory entries are displayed in alphabetical order by default. The program already collected directory entries in memory; we integrated `qsort()` with a comparison function that compares filenames using `strcmp()` to implement sorting.
+
+### Q1. Why is it necessary to read all directory entries into memory before you can sort them?
+Sorting requires random access to all elements so that they can be compared and swapped. To accomplish this, we must first load all directory entries into a dynamic array. For very large directories with millions of files, this could consume a lot of memory or slow performance because all data must fit into RAM before sorting.
+
+### Q2. Explain the purpose and signature of the comparison function required by qsort().
+`qsort()` needs a comparison function that defines the order between two elements.  
+Its prototype is:
+```c
+int compar(const void *a, const void *b);
