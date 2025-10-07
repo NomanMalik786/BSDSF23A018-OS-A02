@@ -35,3 +35,40 @@ else if ((st.st_mode & S_IFMT) == S_IFREG)
 (st.st_mode & S_IRUSR) ? printf("r") : printf("-");
 (st.st_mode & S_IWUSR) ? printf("w") : printf("-");
 (st.st_mode & S_IXUSR) ? printf("x") : printf("-");
+
+## Feature-3: ls-v1.2.0 — Column Display (Down Then Across)
+
+### Summary
+In this feature, I upgraded my custom `ls` utility so that its **default behavior** (when used without any options) now prints files in **multiple columns**, formatted *“down then across.”*  
+The program dynamically adjusts the number of columns and rows based on the **terminal width** and **length of the longest filename**, producing an output that closely resembles the default `ls` command in Linux.
+
+This version also retains the `-l` option from Feature-2 for detailed listings.  
+Key system calls introduced here include **`ioctl()`** (for terminal size detection) and dynamic memory allocation functions (`malloc`, `realloc`, and `free`).
+
+---
+
+### Implementation Details
+
+1. **Reading Directory Entries**
+   - The program first reads all filenames in a directory using `readdir()` and stores them in a dynamically allocated array of strings.  
+   - Hidden files (starting with '.') are skipped.  
+   - While reading, the program tracks the **longest filename length** (`max_len`) to help determine column widths later.
+
+   ```c
+   names[count] = strdup(entry->d_name);
+   if (strlen(entry->d_name) > max_len)
+       max_len = strlen(entry->d_name);
+
+### Q1. Explain the general logic for printing items in a "down then across" columnar format.
+To print items in the "down then across" layout we:
+1. Read all filenames first into an array (so we know the total count and the longest filename).
+2. Compute the longest filename length (max_len) and add spacing (e.g., 2).
+3. Ask the terminal for its width (term_width). If unavailable, use fallback (80).
+4. Compute the number of columns that can fit: `cols = term_width / (max_len + spacing)`. Ensure cols >= 1.
+5. Compute rows = ceil(count / cols).
+6. Print row by row. For row r and column c the index in the names array is `idx = c * rows + r`. If `idx < count` print `names[idx]` padded to column width.
+A simple single loop (printing names sequentially) is insufficient because it prints left-to-right, top-to-bottom sequentially and cannot produce the vertical-first ordering required by "down then across".
+
+### Q2. What is the purpose of ioctl in this context, and limitations of fixed-width fallback?
+`ioctl()` with `TIOCGWINSZ` is used to query the terminal window size (columns and rows). Knowing the terminal width allows the program to dynamically calculate how many columns will fit and adapt the layout to the user's current terminal size. If only a fixed-width fallback (e.g., 80) is used, the program will not adapt when the user resizes the terminal; output may either wrap unexpectedly on small windows or waste space on large ones, reducing usability and not matching the behavior of the standard `ls`.
+
