@@ -1,7 +1,9 @@
-/* src/ls.c
- * ls v1.2.0
+/*
+ * src/ls.c
+ * ls v1.3.0
  * - supports: default multi-column display ("down then across")
  * - supports: -l long listing (uses lstat, getpwuid, getgrgid, ctime)
+ * - supports: -x horizontal column display (row-major)
  *
  * Build: make
  */
@@ -21,6 +23,7 @@
 #include <limits.h>
 #include <getopt.h>
 
+/* Structure to store file information */
 typedef struct {
     char *name;
     char *fullpath;
@@ -97,7 +100,7 @@ static void collect_directory(const char *path, entry_t **out_entries, size_t *o
     }
 
     while ((de = readdir(d)) != NULL) {
-        if (de->d_name[0] == '.') continue; /* skip hidden files for now */
+        if (de->d_name[0] == '.') continue; /* skip hidden files */
         if (count >= capacity) {
             capacity *= 2;
             entry_t *tmp = realloc(arr, capacity * sizeof(entry_t));
@@ -129,7 +132,6 @@ static void collect_directory(const char *path, entry_t **out_entries, size_t *o
         arr[count].is_link = 0;
         arr[count].link_target = NULL;
         if (lstat(arr[count].fullpath, &arr[count].st) == -1) {
-            /* on error, zero the struct */
             memset(&arr[count].st, 0, sizeof(struct stat));
         } else {
             if (S_ISLNK(arr[count].st.st_mode)) {
@@ -146,10 +148,7 @@ static void collect_directory(const char *path, entry_t **out_entries, size_t *o
     }
 
     closedir(d);
-
-    /* sort alphabetically */
     qsort(arr, count, sizeof(entry_t), cmp_entries);
-
     *out_entries = arr;
     *out_n = count;
 }
@@ -197,19 +196,17 @@ static void print_long_listing(entry_t *ents, size_t n) {
         struct tm *tm_info = localtime(&ents[i].st.st_mtime);
         if (!tm_info) strcpy(timebuf, "??? ?? ??:??");
         else {
-            if ((now - ents[i].st.st_mtime) > six_months || (ents[i].st.st_mtime - now) > six_months) {
+            if ((now - ents[i].st.st_mtime) > six_months || (ents[i].st.st_mtime - now) > six_months)
                 strftime(timebuf, sizeof(timebuf), "%b %e  %Y", tm_info);
-            } else {
+            else
                 strftime(timebuf, sizeof(timebuf), "%b %e %H:%M", tm_info);
-            }
         }
         printf("%s ", timebuf);
 
-        if (ents[i].is_link && ents[i].link_target) {
+        if (ents[i].is_link && ents[i].link_target)
             printf("%s -> %s\n", ents[i].name, ents[i].link_target);
-        } else {
+        else
             printf("%s\n", ents[i].name);
-        }
     }
 }
 
@@ -217,7 +214,6 @@ static void print_long_listing(entry_t *ents, size_t n) {
 static void print_columns(entry_t *ents, size_t n) {
     if (n == 0) return;
 
-    /* gather names and compute max length */
     size_t max_len = 0;
     char **names = malloc(n * sizeof(char*));
     if (!names) {
@@ -230,52 +226,69 @@ static void print_columns(entry_t *ents, size_t n) {
         if (l > max_len) max_len = l;
     }
 
-    /* get terminal width via ioctl */
     struct winsize ws;
-    int term_width = 80; /* fallback */
-    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0) {
+    int term_width = 80;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
         term_width = ws.ws_col;
-    }
 
     int spacing = 2;
     size_t col_width = max_len + spacing;
-    int cols = 1;
-    if ((int)col_width <= term_width) {
-        cols = term_width / (int)col_width;
-        if (cols < 1) cols = 1;
-    } else {
-        cols = 1;
-    }
+    int cols = (int)(term_width / col_width);
+    if (cols < 1) cols = 1;
+    int rows = (int)((n + cols - 1) / cols);
 
-    int rows = (int)((n + cols - 1) / cols); /* ceil */
-
-    /* Print row by row, pulling entries from each column */
     for (int r = 0; r < rows; ++r) {
         for (int c = 0; c < cols; ++c) {
             int idx = c * rows + r;
-            if (idx < (int)n) {
-                /* For the last column, do not pad beyond name if you prefer;
-                   but padding is harmless and matches typical ls spacing. */
+            if (idx < (int)n)
                 printf("%-*s", (int)col_width, names[idx]);
-            }
         }
         printf("\n");
     }
 
-    /* Note: do not free names[i] here — they belong to ents[].name */
     free(names);
+}
+
+/* Print horizontal "across" columns (ls -x) */
+static void print_horizontal(entry_t *ents, size_t n) {
+    if (n == 0) return;
+
+    size_t max_len = 0;
+    for (size_t i = 0; i < n; ++i) {
+        size_t len = strlen(ents[i].name);
+        if (len > max_len) max_len = len;
+    }
+
+    struct winsize ws;
+    int term_width = 80;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0 && ws.ws_col > 0)
+        term_width = ws.ws_col;
+
+    int spacing = 2;
+    int col_width = (int)max_len + spacing;
+    int current_width = 0;
+
+    for (size_t i = 0; i < n; ++i) {
+        if (current_width + col_width > term_width) {
+            printf("\n");
+            current_width = 0;
+        }
+        printf("%-*s", col_width, ents[i].name);
+        current_width += col_width;
+    }
+    printf("\n");
 }
 
 int main(int argc, char *argv[]) {
     int opt;
-    int long_listing = 0;
-    while ((opt = getopt(argc, argv, "l")) != -1) {
+    int mode = 0;   /* 0=default, 1=-l, 2=-x */
+
+    while ((opt = getopt(argc, argv, "lx")) != -1) {
         switch (opt) {
-            case 'l':
-                long_listing = 1;
-                break;
+            case 'l': mode = 1; break;
+            case 'x': mode = 2; break;
             default:
-                fprintf(stderr, "Usage: %s [-l] [directory]\n", argv[0]);
+                fprintf(stderr, "Usage: %s [-l | -x] [directory]\n", argv[0]);
                 exit(EXIT_FAILURE);
         }
     }
@@ -287,9 +300,14 @@ int main(int argc, char *argv[]) {
     size_t n = 0;
     collect_directory(path, &ents, &n);
 
-    if (long_listing) print_long_listing(ents, n);
-    else print_columns(ents, n);
+    if (mode == 1)
+        print_long_listing(ents, n);
+    else if (mode == 2)
+        print_horizontal(ents, n);
+    else
+        print_columns(ents, n);
 
     free_entries(ents, n);
     return 0;
 }
+
